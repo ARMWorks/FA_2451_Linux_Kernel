@@ -7,7 +7,7 @@
  * (at your option) any later version.
  *
  * LCD-CPU one wire communication for Mini2451 from
- *         FriendlyARM Guangzhou CO., LTD.
+ *	    FriendlyARM Guangzhou CO., LTD.
  *
  * Copyright (c) 2010 FriendlyARM Guangzhou CO., LTD.  <http://www.arm9.net>
  *
@@ -15,10 +15,10 @@
  *
  *
  * 2010-10-14: Russell Guo <russell.grey@gmail.com>
- *      - Initial version
- *      -- request touch-screen data
- *      -- request LCD type, Firmware version
- *      -  Backlight control
+ *	 - Initial version
+ *	 -- request touch-screen data
+ *	 -- request LCD type, Firmware version
+ *	 -  Backlight control
  *
  * the CRC-8 functions is based on web page from http://lfh1986.blogspot.com
  */
@@ -65,70 +65,14 @@
 // Touch Screen driver interface
 //
 static DECLARE_WAIT_QUEUE_HEAD(ts_waitq);
-static int ts_ready;
 static int has_ts_data = 1;
-static unsigned ts_status;
 static int resumed = 0;
 
-static inline void notify_ts_data(unsigned x, unsigned y, unsigned down)
-{
-	if (!down && !(ts_status &(1U << 31))) {
-		// up repeat, give it up
-		return;
-	}
-
-	ts_status = ((x << 16) | (y)) | (down << 31);
-	ts_ready = 1;
-	wake_up_interruptible(&ts_waitq);
-}
-
-static ssize_t ts_read(struct file *filp, char *buffer, size_t count, loff_t *ppos)
-{
-	unsigned long err;
-
-	if (!ts_ready) {
-		if (filp->f_flags & O_NONBLOCK)
-			return -EAGAIN;
-		else
-			wait_event_interruptible(ts_waitq, ts_ready);
-	}
-
-	ts_ready = 0;
-
-	if (count < sizeof ts_status) {
-		return -EINVAL;
-	} else {
-		count = sizeof ts_status;
-	}
-
-	err = copy_to_user((void *)buffer, (const void *)(&ts_status), sizeof ts_status);
-	return err ? -EFAULT : sizeof ts_status;
-}
-
-static unsigned int ts_poll( struct file *file, struct poll_table_struct *wait)
-{
-	unsigned int mask = 0;
-
-	poll_wait(file, &ts_waitq, wait);
-
-	if (ts_ready)
-		mask |= POLLIN | POLLRDNORM;
-
-	return mask;
-}
-
-static struct file_operations ts_fops = {
-	owner:		THIS_MODULE,
-	read:		ts_read,	
-	poll:   	ts_poll,
+struct ts_info {
+    struct input_dev *inp;
 };
 
-static struct miscdevice ts_misc = {
-	.minor		= 181,
-	.name		= TOUCH_DEVICE_NAME,
-	.fops		= &ts_fops,
-};
-
+struct ts_info *_tsi = NULL;
 
 static DECLARE_WAIT_QUEUE_HEAD(bl_waitq);
 static int bl_ready;
@@ -287,6 +231,7 @@ static unsigned last_req, last_res;
 
 static void one_wire_session_complete(unsigned char req, unsigned int res)
 {
+    struct ts_info *tsi = _tsi;
 	unsigned char crc;
 	const unsigned char *p = (const unsigned char*)&res;
 	total_received ++;
@@ -313,8 +258,11 @@ static void one_wire_session_complete(unsigned char req, unsigned int res)
 				unsigned pressed;
 				x =  ((p[3] >>   4U) << 8U) + p[2];
 				y =  ((p[3] &  0xFU) << 8U) + p[1];
-				pressed = (x != 0xFFFU) && (y != 0xFFFU); 
-				notify_ts_data(x, y, pressed);
+				pressed = (x != 0xFFFU) && (y != 0xFFFU);
+				input_report_abs(tsi->inp, ABS_X, x);
+				input_report_abs(tsi->inp, ABS_Y, y);
+				input_report_abs(tsi->inp, ABS_PRESSURE, pressed);
+				input_sync(tsi->inp);
 			}
 			break;
 
@@ -561,6 +509,15 @@ static int read_proc(char *buf, char **start, off_t offset, int count, int *eof,
 static int ts_1wire_probe(struct platform_device *pdev)
 {
 	int ret;
+	struct ts_info   *tsi  = NULL;
+ 	struct input_dev *inp  = NULL;
+ 
+    /* allocate ts_info data */
+    tsi = kzalloc(sizeof(struct ts_info), GFP_KERNEL);
+    if (! tsi) {
+	   printk(KERN_ERR "fail, %s allocate driver info ...\n", pdev->name);
+	   return -ENOMEM;
+    }
 
 	ret = gpio_request(GPIO_1WIRE, "GPH1_1");
 	if (ret) {
@@ -588,6 +545,40 @@ static int ts_1wire_probe(struct platform_device *pdev)
 		__raw_writel(tint, S3C64XX_TINT_CSTAT);
 	}
 
+	inp = input_allocate_device();
+	if (! inp) {
+		printk(KERN_ERR "fail, %s allocate input device\n", pdev->name);
+		return -ENOMEM;
+	}
+
+	inp->name	  	= "FriendlyARM Touchscreen";
+	inp->phys 	  	= "friendlyarm/event0";
+	inp->dev.parent	= &pdev->dev;
+
+	inp->id.bustype = BUS_HOST;
+	inp->id.vendor  = 0x0001;
+	inp->id.product = 0x0001;
+	inp->id.version = 0x0001;
+
+	inp->absbit[0] = BIT(ABS_X) | BIT(ABS_Y);
+	inp->evbit [0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
+
+	input_set_abs_params(inp, ABS_X, 0, 4095, 0, 0);
+	input_set_abs_params(inp, ABS_Y, 0, 4095, 0, 0);
+	input_set_abs_params(inp, ABS_PRESSURE, 0, 1, 0, 0);
+	input_set_abs_params(inp, ABS_TOOL_WIDTH, 0, 1, 0, 0);
+
+	input_set_drvdata(inp, tsi);
+
+    _tsi = tsi;
+    tsi->inp = inp;
+
+	ret = input_register_device(inp);
+	if (ret) {
+		printk(KERN_ERR "fail, %s register for input device ...\n", pdev->name);
+	   input_free_device(inp);
+		return ret;
+	}
 	return ret;
 }
 
@@ -682,7 +673,7 @@ static int __init dev_init(void)
 {
 	int ret;
 
-	ret = misc_register(&ts_misc) | misc_register(&bl_misc) ;
+	ret = misc_register(&bl_misc) ;
 	if (ret == 0) {
 		create_proc_read_entry("driver/one-wire-info", 0, NULL, read_proc, NULL);
 		printk (TOUCH_DEVICE_NAME"\tinitialized\n");
@@ -707,7 +698,6 @@ static void __exit dev_exit(void)
 
 	remove_proc_entry("driver/one-wire-info", NULL);
 
-	misc_deregister(&ts_misc);
 	misc_deregister(&bl_misc);
 }
 
